@@ -1,0 +1,14 @@
+{
+  "name": "QRLens.Tests",
+  "rootNamespace": "QRLens.Tests",
+  "references": [
+    "QRLens.Runtime"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": false
+}
