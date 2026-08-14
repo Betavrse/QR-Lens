@@ -73,11 +73,12 @@ namespace QRLens.Editor
         {
             ConfigureQuest();
             Directory.CreateDirectory("Builds/Android");
+            var outputPath = $"Builds/Android/QR-Lens-v{PlayerSettings.bundleVersion}.apk";
 
             var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
             {
                 scenes = new[] { "Assets/QRLens/Scenes/Main.unity" },
-                locationPathName = "Builds/Android/QR-Lens-v0.1.apk",
+                locationPathName = outputPath,
                 target = BuildTarget.Android,
                 // Meta XR Core includes its editor-only Operator API layer in Development
                 // builds. That layer is not part of QR Lens and can abort OpenXR startup on
@@ -144,10 +145,10 @@ namespace QRLens.Editor
             };
             config.sceneSupport = OVRProjectConfig.FeatureSupport.Required;
             config.insightPassthroughSupport = OVRProjectConfig.FeatureSupport.Required;
-            config.experimentalFeaturesEnabled = true;
+            config.experimentalFeaturesEnabled = false;
             config.minHorizonOsSdkVersion = 68;
             config.targetHorizonOsSdkVersion = OVRProjectConfig.currentSdkVersion;
-            config.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersOnly;
+            config.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
             OVRProjectConfig.CommitProjectConfig(config);
         }
     }
