@@ -1,10 +1,9 @@
 using System;
 using System.Collections;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using Meta.XR.MRUtilityKit;
+using System.Threading.Tasks;
+using Meta.XR;
 using QRLens.Core;
+using Unity.Collections;
 using UnityEngine;
 #if UNITY_ANDROID && !UNITY_EDITOR
 using UnityEngine.Android;
@@ -12,20 +11,28 @@ using UnityEngine.Android;
 
 namespace QRLens.Platform.Meta
 {
+    /// <summary>
+    /// Quest QR scanner backed by Meta's Passthrough Camera API and an on-device decoder.
+    /// Camera pixels are sampled locally and are never stored or transmitted.
+    /// </summary>
     public sealed class MetaQRScanner : MonoBehaviour, IQRScanner
     {
-        private const string ScenePermission = OVRPermissionsRequester.ScenePermission;
-        private const float RescanDelaySeconds = 0.25f;
-        private const float TrackablePollIntervalSeconds = 0.05f;
-        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
+        private const string CameraPermission = OVRPermissionsRequester.PassthroughCameraAccessPermission;
+        private const float CaptureIntervalSeconds = 0.15f;
+        private const float RescanDelaySeconds = 0.2f;
+        private static readonly Vector2Int RequestedResolution = new Vector2Int(1280, 960);
 
-        private readonly List<MRUKTrackable> _trackables = new List<MRUKTrackable>();
         private Coroutine _startRoutine;
-        private bool _subscribed;
+        private PassthroughCameraAccess _cameraAccess;
+        private Task<DecodeOutcome> _decodeTask;
+        private byte[] _luminanceBuffer;
         private bool _scanningRequested;
+        private bool _acceptDetections;
         private bool _applicationPaused;
+        private bool _cameraPermissionRequestInProgress;
         private float _earliestDetectionTime;
-        private float _nextTrackablePollTime;
+        private float _nextCaptureTime;
+        private int _scanGeneration;
 
         public event Action<QRResult> QRDetected;
 
@@ -36,86 +43,75 @@ namespace QRLens.Platform.Meta
         public void StartScanning()
         {
             _scanningRequested = true;
+            _acceptDetections = true;
+            _scanGeneration++;
             _earliestDetectionTime = Time.realtimeSinceStartup + RescanDelaySeconds;
-            if (_applicationPaused)
+
+            if (_applicationPaused || _startRoutine != null)
             {
                 return;
             }
 
-            // StartScanning is intentionally idempotent. In particular, a UI action that
-            // arrives during the browser-resume recovery must not cancel that recovery.
-            if (_startRoutine != null)
+            if (_cameraAccess && _cameraAccess.IsPlaying)
             {
+                SetState(QRScannerState.Scanning, "Scanning…");
                 return;
             }
 
-            BeginStart(false);
-        }
-
-        private void Update()
-        {
-            if (!_scanningRequested || State != QRScannerState.Scanning || !MRUK.Instance ||
-                Time.realtimeSinceStartup < _earliestDetectionTime ||
-                Time.realtimeSinceStartup < _nextTrackablePollTime)
-            {
-                return;
-            }
-
-            _nextTrackablePollTime = Time.realtimeSinceStartup + TrackablePollIntervalSeconds;
-            MRUK.Instance.GetTrackables(_trackables);
-            foreach (var trackable in _trackables)
-            {
-                if (TryDetect(trackable))
-                {
-                    break;
-                }
-            }
+            _startRoutine = StartCoroutine(StartCameraRoutine());
         }
 
         public void StopScanning()
         {
             _scanningRequested = false;
+            _acceptDetections = false;
+            _scanGeneration++;
+
             if (_startRoutine != null)
             {
                 StopCoroutine(_startRoutine);
                 _startRoutine = null;
             }
 
-            SetTrackingEnabled(false);
+            if (_cameraAccess)
+            {
+                _cameraAccess.enabled = false;
+            }
+
             SetState(QRScannerState.Stopped, "Scanner stopped");
         }
 
-        private void BeginStart(bool resetTracker)
+        private void Update()
         {
-            if (_startRoutine != null)
+            CompleteDecodeIfReady();
+
+            if (!_scanningRequested || !_acceptDetections || _applicationPaused ||
+                !_cameraAccess || !_cameraAccess.IsPlaying)
             {
-                StopCoroutine(_startRoutine);
+                return;
             }
 
-            _startRoutine = StartCoroutine(StartScanningRoutine(resetTracker));
+            if (State != QRScannerState.Scanning)
+            {
+                SetState(QRScannerState.Scanning, "Scanning…");
+            }
+
+            if (_decodeTask != null || Time.realtimeSinceStartup < _earliestDetectionTime ||
+                Time.realtimeSinceStartup < _nextCaptureTime || !_cameraAccess.IsUpdatedThisFrame)
+            {
+                return;
+            }
+
+            _nextCaptureTime = Time.realtimeSinceStartup + CaptureIntervalSeconds;
+            CaptureAndDecode(_scanGeneration);
         }
 
-        private IEnumerator StartScanningRoutine(bool resetTracker)
+        private IEnumerator StartCameraRoutine()
         {
-            SetState(QRScannerState.RequestingPermission, "Preparing scanner…");
-
-            var timeoutAt = Time.realtimeSinceStartup + 10f;
-            while (!MRUK.Instance && Time.realtimeSinceStartup < timeoutAt)
-            {
-                yield return null;
-            }
-
-            if (!MRUK.Instance)
-            {
-                SetState(QRScannerState.Error, "Meta MR services did not initialize.");
-                _startRoutine = null;
-                yield break;
-            }
-
-            Subscribe();
+            SetState(QRScannerState.RequestingPermission, "Preparing camera…");
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-            if (!Permission.HasUserAuthorizedPermission(ScenePermission))
+            if (!Permission.HasUserAuthorizedPermission(CameraPermission))
             {
                 var permissionFinished = false;
                 var permissionGranted = false;
@@ -126,55 +122,59 @@ namespace QRLens.Platform.Meta
                     permissionFinished = true;
                 };
                 callbacks.PermissionDenied += _ => permissionFinished = true;
-                Permission.RequestUserPermission(ScenePermission, callbacks);
 
+                _cameraPermissionRequestInProgress = true;
+                Permission.RequestUserPermission(CameraPermission, callbacks);
                 while (!permissionFinished)
                 {
                     yield return null;
                 }
 
-                if (!permissionGranted && !Permission.HasUserAuthorizedPermission(ScenePermission))
+                _cameraPermissionRequestInProgress = false;
+                if (!permissionGranted && !Permission.HasUserAuthorizedPermission(CameraPermission))
                 {
                     SetState(
                         QRScannerState.PermissionDenied,
-                        "Room and spatial-data permission is required to detect QR codes.");
+                        "Headset camera permission is required to scan QR codes.");
                     _startRoutine = null;
                     yield break;
                 }
             }
 #endif
 
-            if (!MRUK.Instance.QRCodeTrackingSupported)
+            if (!PassthroughCameraAccess.IsSupported)
             {
                 SetState(
                     QRScannerState.Unavailable,
-                    "QR tracking is unavailable. Use a Quest 3/3S with current Horizon OS and grant spatial-data access.");
+                    "Camera scanning requires Quest 3 or Quest 3S with Horizon OS v74 or newer.");
                 _startRoutine = null;
                 yield break;
             }
 
-            if (resetTracker)
-            {
 #if UNITY_ANDROID && !UNITY_EDITOR
-                var focusTimeoutAt = Time.realtimeSinceStartup + 5f;
-                while (!OVRManager.hasVrFocus && Time.realtimeSinceStartup < focusTimeoutAt)
-                {
-                    yield return null;
-                }
+            while (_scanningRequested && !_applicationPaused && !OVRManager.hasVrFocus)
+            {
+                yield return null;
+            }
 #endif
 
-                // A browser transition can suspend MRUK while ConfigureTrackers is in flight.
-                // Cycling the component invokes MRUK's supported OnDisable cleanup, which
-                // clears the stale task and native tracker configuration before we re-enable it.
-                SetTrackingEnabled(false);
-                var mruk = MRUK.Instance;
-                if (mruk && mruk.enabled)
-                {
-                    mruk.enabled = false;
-                    yield return null;
-                    mruk.enabled = true;
-                    yield return null;
-                }
+            if (!_scanningRequested || _applicationPaused)
+            {
+                _startRoutine = null;
+                yield break;
+            }
+
+            EnsureCameraAccess();
+            if (!_cameraAccess.enabled)
+            {
+                _cameraAccess.enabled = true;
+            }
+
+            var timeoutAt = Time.realtimeSinceStartup + 12f;
+            while (_scanningRequested && !_applicationPaused && !_cameraAccess.IsPlaying &&
+                   Time.realtimeSinceStartup < timeoutAt)
+            {
+                yield return null;
             }
 
             if (!_scanningRequested || _applicationPaused)
@@ -183,13 +183,137 @@ namespace QRLens.Platform.Meta
                 yield break;
             }
 
-            SetTrackingEnabled(true);
-            SetState(QRScannerState.Scanning, "Scanning…");
+            if (!_cameraAccess.IsPlaying)
+            {
+                SetState(
+                    QRScannerState.Error,
+                    "Quest could not start the headset camera. Check Camera permission, then restart QR Lens.");
+                _startRoutine = null;
+                yield break;
+            }
+
+            Debug.Log(
+                $"QR Lens scanner: passthrough camera active at " +
+                $"{_cameraAccess.CurrentResolution.x}x{_cameraAccess.CurrentResolution.y}.");
+            SetState(
+                _acceptDetections ? QRScannerState.Scanning : QRScannerState.Paused,
+                _acceptDetections ? "Scanning…" : "QR detected");
             _startRoutine = null;
+        }
+
+        private void EnsureCameraAccess()
+        {
+            if (_cameraAccess)
+            {
+                return;
+            }
+
+            var cameraObject = new GameObject("QR Lens Passthrough Camera");
+            cameraObject.SetActive(false);
+            _cameraAccess = cameraObject.AddComponent<PassthroughCameraAccess>();
+            _cameraAccess.enabled = false;
+            _cameraAccess.CameraPosition = PassthroughCameraAccess.CameraPositionType.Left;
+            _cameraAccess.RequestedResolution = RequestedResolution;
+            _cameraAccess.MaxFramerate = 30;
+            cameraObject.SetActive(true);
+            _cameraAccess.enabled = true;
+        }
+
+        private void CaptureAndDecode(int generation)
+        {
+            NativeArray<Color32> colors;
+            try
+            {
+                colors = _cameraAccess.GetColors();
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"QR Lens scanner: camera readback failed: {exception.Message}");
+                return;
+            }
+
+            var resolution = _cameraAccess.CurrentResolution;
+            var pixelCount = resolution.x * resolution.y;
+            if (!colors.IsCreated || resolution.x <= 0 || resolution.y <= 0 || colors.Length < pixelCount)
+            {
+                return;
+            }
+
+            if (_luminanceBuffer == null || _luminanceBuffer.Length != pixelCount)
+            {
+                _luminanceBuffer = new byte[pixelCount];
+            }
+
+            for (var index = 0; index < pixelCount; index++)
+            {
+                var color = colors[index];
+                _luminanceBuffer[index] = (byte)((color.r * 77 + color.g * 150 + color.b * 29) >> 8);
+            }
+
+            var luminance = _luminanceBuffer;
+            var width = resolution.x;
+            var height = resolution.y;
+            _decodeTask = Task.Run(() => Decode(luminance, width, height, generation));
+        }
+
+        private void CompleteDecodeIfReady()
+        {
+            if (_decodeTask == null || !_decodeTask.IsCompleted)
+            {
+                return;
+            }
+
+            var completedTask = _decodeTask;
+            _decodeTask = null;
+
+            if (completedTask.IsFaulted)
+            {
+                var message = completedTask.Exception?.GetBaseException().Message ?? "Unknown decoder error";
+                Debug.LogWarning($"QR Lens scanner: decoder failed: {message}");
+                return;
+            }
+
+            if (completedTask.IsCanceled || completedTask.Result == null ||
+                completedTask.Result.Generation != _scanGeneration || !_scanningRequested ||
+                !_acceptDetections || State != QRScannerState.Scanning ||
+                Time.realtimeSinceStartup < _earliestDetectionTime)
+            {
+                return;
+            }
+
+            var outcome = completedTask.Result;
+            _acceptDetections = false;
+            SetState(QRScannerState.Paused, "QR detected");
+            Debug.Log($"QR Lens scanner: decoded QR payload ({outcome.Payload.Length} characters).");
+
+            var head = Camera.main ? Camera.main.transform : null;
+            var position = head ? head.position + head.forward * 1.5f : Vector3.zero;
+            var rotation = head ? head.rotation : Quaternion.identity;
+            QRDetected?.Invoke(new QRResult(outcome.Payload, position, rotation, outcome.HasTextPayload));
+        }
+
+        private static DecodeOutcome Decode(byte[] luminance, int width, int height, int generation)
+        {
+            if (!QRFrameDecoder.TryDecodeLuminance(
+                    luminance,
+                    width,
+                    height,
+                    out var payload,
+                    out var hasTextPayload))
+            {
+                return null;
+            }
+
+            return new DecodeOutcome(generation, payload, hasTextPayload);
         }
 
         private void OnApplicationPause(bool paused)
         {
+            if (_cameraPermissionRequestInProgress)
+            {
+                return;
+            }
+
             if (paused)
             {
                 _applicationPaused = true;
@@ -199,7 +323,6 @@ namespace QRLens.Platform.Meta
                     _startRoutine = null;
                 }
 
-                SetTrackingEnabled(false);
                 if (_scanningRequested)
                 {
                     SetState(QRScannerState.Paused, "Scanner suspended");
@@ -208,95 +331,21 @@ namespace QRLens.Platform.Meta
                 return;
             }
 
-            var isReturningToApp = _applicationPaused;
+            var returningToApp = _applicationPaused;
             _applicationPaused = false;
-            if (isReturningToApp && _scanningRequested)
+            if (returningToApp && _scanningRequested && _startRoutine == null)
             {
-                BeginStart(true);
+                _startRoutine = StartCoroutine(StartCameraRoutine());
             }
         }
 
         private void OnDestroy()
         {
-            if (_subscribed && MRUK.Instance)
+            _scanGeneration++;
+            if (_cameraAccess)
             {
-                MRUK.Instance.SceneSettings.TrackableAdded.RemoveListener(OnTrackableAdded);
+                Destroy(_cameraAccess.gameObject);
             }
-        }
-
-        private void Subscribe()
-        {
-            if (_subscribed)
-            {
-                return;
-            }
-
-            MRUK.Instance.SceneSettings.TrackableAdded.AddListener(OnTrackableAdded);
-            _subscribed = true;
-        }
-
-        private void OnTrackableAdded(MRUKTrackable trackable)
-        {
-            TryDetect(trackable);
-        }
-
-        private bool TryDetect(MRUKTrackable trackable)
-        {
-            if (!_scanningRequested || State != QRScannerState.Scanning ||
-                Time.realtimeSinceStartup < _earliestDetectionTime || !trackable || !trackable.IsTracked ||
-                trackable.TrackableType != OVRAnchor.TrackableType.QRCode)
-            {
-                return false;
-            }
-
-            var payload = ReadPayload(trackable, out var hasTextPayload);
-
-            // Pause immediately so a persistent marker cannot trigger the app every frame.
-            _scanningRequested = false;
-            SetTrackingEnabled(false);
-            SetState(QRScannerState.Paused, "QR detected");
-            QRDetected?.Invoke(
-                new QRResult(payload, trackable.transform.position, trackable.transform.rotation, hasTextPayload));
-            return true;
-        }
-
-        private static string ReadPayload(MRUKTrackable trackable, out bool hasTextPayload)
-        {
-            if (trackable.MarkerPayloadString != null)
-            {
-                hasTextPayload = true;
-                return trackable.MarkerPayloadString;
-            }
-
-            if (trackable.MarkerPayloadBytes is { Length: > 0 } bytes)
-            {
-                try
-                {
-                    hasTextPayload = true;
-                    return StrictUtf8.GetString(bytes);
-                }
-                catch (DecoderFallbackException)
-                {
-                    hasTextPayload = false;
-                    var preview = string.Join(" ", bytes.Take(24).Select(value => value.ToString("X2")));
-                    return $"Binary QR payload ({bytes.Length} bytes): {preview}{(bytes.Length > 24 ? " …" : string.Empty)}";
-                }
-            }
-
-            hasTextPayload = true;
-            return string.Empty;
-        }
-
-        private static void SetTrackingEnabled(bool enabled)
-        {
-            if (!MRUK.Instance)
-            {
-                return;
-            }
-
-            var configuration = MRUK.Instance.SceneSettings.TrackerConfiguration;
-            configuration.QRCodeTrackingEnabled = enabled;
-            MRUK.Instance.SceneSettings.TrackerConfiguration = configuration;
         }
 
         private void SetState(QRScannerState state, string message)
@@ -313,6 +362,22 @@ namespace QRLens.Platform.Meta
             }
 
             StateChanged?.Invoke(state, message);
+        }
+
+        private sealed class DecodeOutcome
+        {
+            public DecodeOutcome(int generation, string payload, bool hasTextPayload)
+            {
+                Generation = generation;
+                Payload = payload ?? string.Empty;
+                HasTextPayload = hasTextPayload;
+            }
+
+            public int Generation { get; }
+
+            public string Payload { get; }
+
+            public bool HasTextPayload { get; }
         }
     }
 }

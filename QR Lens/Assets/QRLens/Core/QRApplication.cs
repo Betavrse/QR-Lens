@@ -8,6 +8,7 @@ namespace QRLens.Core
         private IQRScanner _scanner;
         private QRPanel _panel;
         private QRResult _currentResult;
+        private bool _resumeScanAfterExternalApp;
 
         public void Initialize(IQRScanner scanner, QRPanel panel)
         {
@@ -97,7 +98,39 @@ namespace QRLens.Core
                 return;
             }
 
-            DismissCurrentResult();
+            // Application.OpenURL backgrounds QR Lens on Quest. Re-arm result delivery
+            // only after Unity reports that QR Lens has resumed and the camera can restart.
+            _currentResult = null;
+            _resumeScanAfterExternalApp = true;
+            _panel.ShowScanning("Opening browser…");
+        }
+
+        private void OnApplicationPause(bool paused)
+        {
+            if (!paused)
+            {
+                ResumeScanningAfterExternalApp();
+            }
+        }
+
+        private void OnApplicationFocus(bool focused)
+        {
+            if (focused)
+            {
+                ResumeScanningAfterExternalApp();
+            }
+        }
+
+        private void ResumeScanningAfterExternalApp()
+        {
+            if (!_resumeScanAfterExternalApp || _scanner == null || !_panel)
+            {
+                return;
+            }
+
+            _resumeScanAfterExternalApp = false;
+            _panel.ShowScanning("Scanning…");
+            _scanner.StartScanning();
         }
 
         private void DismissCurrentResult()

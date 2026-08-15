@@ -2,7 +2,12 @@
   "name": "QRLens.Tests",
   "rootNamespace": "QRLens.Tests",
   "references": [
-    "QRLens.Runtime"
+    "QRLens.Runtime",
+    "UnityEngine.UI"
+  ],
+  "overrideReferences": true,
+  "precompiledReferences": [
+    "zxing.dll"
   ],
   "optionalUnityReferences": [
     "TestAssemblies"

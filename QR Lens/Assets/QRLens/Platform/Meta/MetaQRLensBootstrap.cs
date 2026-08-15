@@ -196,8 +196,10 @@ namespace QRLens.Platform.Meta
             // scene-authored MRUK component gets. MRUK.Update dereferences SceneSettings.
             mruk.SceneSettings ??= new MRUK.MRUKSettings();
             mruk.SceneSettings.LoadSceneOnStartup = false;
+            mruk.EnableWorldLock = false;
+            // QR Lens uses MRUK's Passthrough Camera Access, not its unreliable marker tracker.
             var configuration = mruk.SceneSettings.TrackerConfiguration;
-            configuration.QRCodeTrackingEnabled = true;
+            configuration.QRCodeTrackingEnabled = false;
             mruk.SceneSettings.TrackerConfiguration = configuration;
         }
     }

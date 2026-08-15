@@ -24,13 +24,13 @@ MonoBehaviour:
   faceTrackingSupport: 0
   eyeTrackingSupport: 0
   colocationSessionSupport: 0
-  sceneSupport: 2
+  sceneSupport: 0
   boundaryVisibilitySupport: 0
   disableBackups: 1
   enableNSCConfig: 1
   securityXmlPath: 
   horizonOsSdkDisabled: 0
-  minHorizonOsSdkVersion: 68
+  minHorizonOsSdkVersion: 74
   targetHorizonOsSdkVersion: 205
   skipUnneededShaders: 0
   enableIL2CPPLTO: 0
@@ -42,7 +42,7 @@ MonoBehaviour:
   experimentalFeaturesEnabled: 0
   insightPassthroughEnabled: 0
   _insightPassthroughSupport: 2
-  isPassthroughCameraAccessEnabled: 0
+  isPassthroughCameraAccessEnabled: 1
   _processorFavor: 0
   systemSplashScreen: {fileID: 0}
   systemSplashScreenType: 0

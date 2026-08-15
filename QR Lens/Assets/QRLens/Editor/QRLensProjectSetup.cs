@@ -1,5 +1,6 @@
 using System.IO;
 using System.Linq;
+using System.Xml.Linq;
 using Meta.XR;
 using UnityEditor;
 using UnityEditor.XR.Management;
@@ -71,6 +72,12 @@ namespace QRLens.Editor
         [MenuItem("Tools/QR Lens/Build Quest APK")]
         public static void BuildQuestApk()
         {
+            if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.Android &&
+                !EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android))
+            {
+                throw new System.InvalidOperationException("Could not switch the Unity project to Android.");
+            }
+
             ConfigureQuest();
             Directory.CreateDirectory("Builds/Android");
             var outputPath = $"Builds/Android/QR-Lens-v{PlayerSettings.bundleVersion}.apk";
@@ -92,7 +99,76 @@ namespace QRLens.Editor
                     $"Quest APK build failed: {report.summary.result} ({report.summary.totalErrors} errors)");
             }
 
+            ValidateGeneratedAndroidManifest();
             Debug.Log($"QR Lens APK built: {report.summary.outputPath}");
+        }
+
+        private static void ValidateGeneratedAndroidManifest()
+        {
+            const string manifestPath =
+                "Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/src/main/AndroidManifest.xml";
+            if (!File.Exists(manifestPath))
+            {
+                throw new System.InvalidOperationException(
+                    $"Could not validate the generated Android manifest at {manifestPath}.");
+            }
+
+            var document = XDocument.Load(manifestPath);
+            var root = document.Root ??
+                       throw new System.InvalidOperationException("The generated Android manifest is empty.");
+            XNamespace android = "http://schemas.android.com/apk/res/android";
+            XNamespace horizonOs = "http://schemas.horizonos/sdk";
+
+            RequireManifestEntry(root, "uses-permission", android, "horizonos.permission.HEADSET_CAMERA");
+            RequireManifestEntry(root, "uses-feature", android, "com.oculus.feature.PASSTHROUGH");
+            RejectManifestEntry(root, "uses-permission", android, "com.oculus.permission.USE_SCENE");
+            RejectManifestEntry(root, "uses-permission", android, "com.oculus.permission.USE_ANCHOR_API");
+
+            if (root.Elements("uses-feature").Any(element =>
+                    (string)element.Attribute(android + "name") == "com.oculus.experimental.enabled"))
+            {
+                throw new System.InvalidOperationException(
+                    "The generated manifest contains the prohibited com.oculus.experimental.enabled feature.");
+            }
+
+            var horizonSdk = root.Element(horizonOs + "uses-horizonos-sdk");
+            if (horizonSdk == null ||
+                !int.TryParse((string)horizonSdk.Attribute(horizonOs + "minSdkVersion"), out var minSdkVersion) ||
+                minSdkVersion < 74)
+            {
+                throw new System.InvalidOperationException(
+                    "The generated manifest must require Horizon OS SDK 74 or newer.");
+            }
+        }
+
+        private static void RequireManifestEntry(
+            XElement root,
+            string elementName,
+            XNamespace android,
+            string requiredName)
+        {
+            if (root.Elements(elementName).Any(element =>
+                    (string)element.Attribute(android + "name") == requiredName))
+            {
+                return;
+            }
+
+            throw new System.InvalidOperationException(
+                $"The generated Android manifest is missing required entry {requiredName}.");
+        }
+
+        private static void RejectManifestEntry(
+            XElement root,
+            string elementName,
+            XNamespace android,
+            string rejectedName)
+        {
+            if (root.Elements(elementName).Any(element =>
+                    (string)element.Attribute(android + "name") == rejectedName))
+            {
+                throw new System.InvalidOperationException(
+                    $"The generated Android manifest contains unnecessary entry {rejectedName}.");
+            }
         }
 
         private static XRGeneralSettingsPerBuildTarget GetOrCreateGeneralSettings()
@@ -143,10 +219,12 @@ namespace QRLens.Editor
                 OVRProjectConfig.DeviceType.Quest3,
                 OVRProjectConfig.DeviceType.Quest3S
             };
-            config.sceneSupport = OVRProjectConfig.FeatureSupport.Required;
+            config.anchorSupport = OVRProjectConfig.AnchorSupport.Disabled;
+            config.sceneSupport = OVRProjectConfig.FeatureSupport.None;
             config.insightPassthroughSupport = OVRProjectConfig.FeatureSupport.Required;
+            config.isPassthroughCameraAccessEnabled = true;
             config.experimentalFeaturesEnabled = false;
-            config.minHorizonOsSdkVersion = 68;
+            config.minHorizonOsSdkVersion = 74;
             config.targetHorizonOsSdkVersion = OVRProjectConfig.currentSdkVersion;
             config.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
             OVRProjectConfig.CommitProjectConfig(config);
